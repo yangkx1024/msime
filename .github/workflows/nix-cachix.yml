@@ -1,0 +1,134 @@
+# 只存在于 fork（yangkx1024/msime）的 nix-cachix 分支：每天把上游 develop 同步过来，构建本机系统用到的包并推到 yangkx.cachix.org。
+#
+# 这个分支必须是 fork 的默认分支：schedule 只在默认分支上触发，而默认分支上只有本文件，上游的定时任务（macOS CI、CodeQL、Stale 等）也就不再在 fork 上跑。sync 任务还会把 fork 上登记过的其余 workflow 全部 disable，别的分支上的上游 workflow 同样不会被触发。
+#
+# 分支 = 上游 develop 加上面一个提交：这个提交去掉 .github/workflows/ 和 .github/dependabot.yml，放上本分支自己的 .github/workflows/。每次同步把这个提交重新放到最新的上游 develop 上再强推，沿用它的作者和提交信息，分支历史始终是上游的历史加一个提交。改本分支的 workflow 时 amend 这个提交，不要另加提交：同步只看最上面那个提交。
+#
+# platforms/linux/nix/ 下的源码都经 lib.fileset 挑过，不含 .github，所以这里构建出的 store 路径和直接用上游 develop 构建的完全相同。
+#
+# 需要的 secret：CACHIX_AUTH_TOKEN（yangkx 这个 cache 的写权限 token）。
+name: Nix Cachix
+
+on:
+  schedule:
+    # 每天 00:00（Asia/Shanghai，UTC+08:00）。
+    - cron: '0 16 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: nix-cachix
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  UPSTREAM: metasequoiaime/msime
+  UPSTREAM_BRANCH: develop
+  CACHIX_NAME: yangkx
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    outputs:
+      sha: ${{ steps.sync.outputs.sha }}
+    steps:
+      # 要看到上面那个提交的父提交，判断上游有没有动。
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+
+      - name: Sync upstream develop
+        id: sync
+        run: |
+          git fetch --no-tags --depth=1 "https://github.com/$UPSTREAM.git" "$UPSTREAM_BRANCH"
+          upstream=$(git rev-parse FETCH_HEAD)
+          git read-tree FETCH_HEAD
+          git rm -r -q --cached --ignore-unmatch -- .github/workflows .github/dependabot.yml
+          git ls-tree -r HEAD -- .github/workflows | git update-index --index-info
+          tree=$(git write-tree)
+          if [ "$(git rev-parse HEAD^)" = "$upstream" ] && [ "$tree" = "$(git rev-parse 'HEAD^{tree}')" ]; then
+            echo "Already at $UPSTREAM@$upstream"
+            sha=$(git rev-parse HEAD)
+          else
+            sha=$(git log -1 --format=%B | GIT_AUTHOR_NAME="$(git log -1 --format=%an)" GIT_AUTHOR_EMAIL="$(git log -1 --format=%ae)" GIT_AUTHOR_DATE="$(git log -1 --format=%aD)" \
+              git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit-tree "$tree" -p FETCH_HEAD)
+            git push --force-with-lease="$GITHUB_REF_NAME:$(git rev-parse HEAD)" origin "$sha:refs/heads/$GITHUB_REF_NAME"
+            echo "Rebased onto $UPSTREAM@$upstream as $sha"
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      # 上游新增的 workflow 一旦出现在 fork 的某个分支上就会被登记为 active，这里每天关一遍。
+      - name: Disable upstream workflows
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/workflows" \
+            --jq '.workflows[] | select(.state == "active" and (.path | startswith(".github/workflows/")) and .path != ".github/workflows/nix-cachix.yml") | "\(.id) \(.path)"' |
+          while read -r id path; do
+            echo "Disabling $path"
+            gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/$id/disable"
+          done
+
+  build:
+    needs: sync
+    runs-on: ubuntu-latest
+    env:
+      # 只构建系统实际用到、cache.nixos.org 又没有的包，免得挤占 cache 空间。换成 IBus 时改成 msime-ibus。
+      PACKAGES: msime-fcitx5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+
+      # 按 yangkx1024/nixos-flake 锁定的 nixpkgs 求值：那边的 msime 输入 follows 自己的 nixpkgs，模块和 overlay 也按系统的 pkgs 构建，这样得到的 drv 才与系统的相同。
+      # 输出路径已经包含了源码和 nixpkgs，cache 里都有就说明上游和 nixpkgs 都没变，后面全部跳过。
+      - name: Find uncached packages
+        id: plan
+        run: |
+          for p in $PACKAGES; do
+            nix eval --json --inputs-from github:yangkx1024/nixos-flake --override-input nixpkgs nixpkgs \
+              ".#packages.x86_64-linux.$p" --apply 'p: { drv = p.drvPath; out = p.outPath; }'
+          done | jq -s . > "$RUNNER_TEMP/packages.json"
+          jq -r '.[] | "\(.drv) \(.out)"' "$RUNNER_TEMP/packages.json" | while read -r drv out; do
+            nix path-info --store "https://$CACHIX_NAME.cachix.org" "$out" > /dev/null 2>&1 || echo "$drv^*"
+          done > "$RUNNER_TEMP/missing"
+          cat "$RUNNER_TEMP/missing"
+          [ -s "$RUNNER_TEMP/missing" ] && echo "missing=true" >> "$GITHUB_OUTPUT" || echo "All packages already cached"
+
+      # Rust 工作区加 Tauri 前端，runner 自带的十几 GB 空间不够。
+      - name: Free disk space
+        if: steps.plan.outputs.missing
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+
+      # 只用来加 substituter；推送在最后一步按输出的闭包做，不把 crane 的 -deps 这类中间产物推上去占空间。
+      - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
+        if: steps.plan.outputs.missing
+        with:
+          name: ${{ env.CACHIX_NAME }}
+          skipPush: true
+
+      # .drv 已由上一步的求值写进 store，直接按它构建，不必再带 nixpkgs 覆盖参数求值一遍。
+      - name: Build
+        id: build
+        if: steps.plan.outputs.missing
+        run: xargs nix build --no-link -L --keep-going < "$RUNNER_TEMP/missing"
+
+      # 一个包失败时，已经构建好的照样推上去。
+      - name: Push to Cachix
+        if: ${{ !cancelled() && steps.build.outcome != 'skipped' }}
+        env:
+          CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+        run: |
+          mapfile -t outs < <(jq -r '.[].out' "$RUNNER_TEMP/packages.json" | while read -r out; do [ ! -e "$out" ] || echo "$out"; done)
+          [ "${#outs[@]}" -eq 0 ] || cachix push "$CACHIX_NAME" "${outs[@]}"
